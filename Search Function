@@ -1,0 +1,266 @@
+/*
+ * searchgrep.c
+ *
+ * A simple recursive search utility that scans files and directories for a
+ * user‑supplied regular expression. The program behaves in a manner similar
+ * to the classic `grep` tool, but with a deliberately limited feature
+ * set to keep the implementation concise and portable. It supports the
+ * following features:
+ *
+ *   - Recursive directory traversal when given a directory path.
+ *   - POSIX extended regular expression matching via <regex.h>.
+ *   - Optional ANSI color highlighting of matched substrings.
+ *   - Skipping of binary files, determined heuristically by scanning the
+ *     initial portion of the file for NUL bytes.
+ *   - Support for UTF‑8 encoded text files. It treats input as UTF‑8
+ *     encoded, but it does not validate multibyte boundaries – the
+ *     matching operates on bytes, which is acceptable for typical
+ *     searching. Highlighting uses byte offsets returned by regex; UTF‑8
+ *     characters are not split when printing lines, because they are
+ *     read as a sequence of bytes and printed unchanged.
+ *
+ * Usage:
+ *   ./searchgrep [OPTIONS] PATTERN PATH
+ *
+ * Where PATTERN is a POSIX extended regular expression and PATH is either
+ * a single file or a directory to search recursively. Supported options:
+ *   -h, --help      Display a brief usage message and exit.
+ *   -c, --color     Enable ANSI color highlighting of matches.
+ *   -n, --no‑color  Disable color highlighting even if the terminal
+ *                   supports it.
+ *
+ * The program prints each match on its own line in the following format:
+ *   <file_path>:<line_number>:<line>
+ * When color is enabled, the matched substring within <line> is wrapped
+ * in ANSI color escape codes (bright red by default).
+ *
+ * This program is intended as an educational example and does not aim
+ * to replicate all of grep's features. Error handling is basic; in
+ * production code you would want more robust reporting and resource
+ * cleanup.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <regex.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define COLOR_RED   "\033[31;1m"
+#define COLOR_RESET "\033[0m"
+
+/* Structure holding program options. */
+typedef struct {
+    int use_color;      /* Whether to highlight matches. */
+    int color_forced;   /* User explicitly enabled color. */
+    int no_color;       /* User explicitly disabled color. */
+} Options;
+
+static void print_usage(const char *progname) {
+    fprintf(stderr,
+            "Usage: %s [OPTIONS] PATTERN PATH\n"
+            "Search recursively for PATTERN in files under PATH.\n\n"
+            "Options:\n"
+            "  -h, --help      Display this help message and exit.\n"
+            "  -c, --color     Enable ANSI color highlighting of matches.\n"
+            "  -n, --no-color  Disable ANSI color highlighting.\n"
+            "\n"
+            "Examples:\n"
+            "  %s -c 'main\\(.*\\)' src/\n"
+            "  %s --no-color foo config.h\n",
+            progname, progname, progname);
+}
+
+/* Heuristic to detect whether a file is binary. It reads the first
+ * 'samples' bytes from the file and returns true if any NUL bytes are
+ * encountered. */
+static int is_binary_file(const char *filepath) {
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) {
+        return 0; /* treat unreadable files as non-binary to report error later */
+    }
+    int binary = 0;
+    size_t samples = 4096;
+    unsigned char buffer[4096];
+    size_t n = fread(buffer, 1, samples, fp);
+    for (size_t i = 0; i < n; ++i) {
+        if (buffer[i] == '\0') {
+            binary = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return binary;
+}
+
+/* Print a line with optional highlighting. 'line' must be a NUL‑terminated
+ * string. 'match_start' and 'match_end' specify the byte offsets of the
+ * match within 'line'; if no match, pass -1 for both to print the entire
+ * line without highlighting. */
+static void print_line(const char *filepath, size_t lineno,
+                       const char *line, int match_start, int match_end,
+                       const Options *opts) {
+    /* Print path and line number */
+    printf("%s:%zu:", filepath, lineno);
+    /* Print the line with highlighting if requested */
+    if (opts->use_color && match_start >= 0 && match_end > match_start) {
+        /* Print portion before match */
+        fwrite(line, 1, (size_t)match_start, stdout);
+        /* Highlight match */
+        printf(COLOR_RED);
+        fwrite(line + match_start, 1, (size_t)(match_end - match_start), stdout);
+        printf(COLOR_RESET);
+        /* Print rest of line */
+        fputs(line + match_end, stdout);
+    } else {
+        fputs(line, stdout);
+    }
+}
+
+/* Search an individual file for matches. The file is opened in text mode
+ * (with binary detection performed separately). Each line is read using
+ * getline(), then regexec() is used to find matches. The first match in
+ * each line is highlighted (if enabled). */
+static void search_file(const char *filepath, regex_t *re, const Options *opts) {
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) {
+        fprintf(stderr, "Error opening '%s': %s\n", filepath, strerror(errno));
+        return;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t len;
+    size_t lineno = 0;
+    while ((len = getline(&line, &cap, fp)) != -1) {
+        lineno++;
+        /* Strip newline for uniform printing (we'll print the newline from getline) */
+        if (len > 0 && line[len - 1] == '\n') {
+            line[len - 1] = '\0';
+            len--;
+        }
+        regmatch_t pmatch;
+        int ret = regexec(re, line, 1, &pmatch, 0);
+        if (ret == 0) {
+            /* Match found: highlight if supported */
+            print_line(filepath, lineno, line, pmatch.rm_so, pmatch.rm_eo, opts);
+            /* Print newline because we removed it above */
+            putchar('\n');
+        }
+    }
+    free(line);
+    fclose(fp);
+}
+
+/* Recursively traverse a directory. For each entry, if it's a file, search it;
+ * if it's a directory (and not a dot entry), recurse into it. Symbolic
+ * links are followed; you could modify this to skip them if desired. */
+static void traverse_directory(const char *dirpath, regex_t *re, const Options *opts) {
+    DIR *dir = opendir(dirpath);
+    if (!dir) {
+        fprintf(stderr, "Cannot open directory '%s': %s\n", dirpath, strerror(errno));
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        /* Skip '.' and '..' */
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        /* Build full path */
+        size_t pathlen = strlen(dirpath) + strlen(name) + 2;
+        char *fullpath = malloc(pathlen);
+        if (!fullpath) {
+            fprintf(stderr, "Out of memory\n");
+            break;
+        }
+        snprintf(fullpath, pathlen, "%s/%s", dirpath, name);
+        struct stat st;
+        if (stat(fullpath, &st) == -1) {
+            fprintf(stderr, "Cannot stat '%s': %s\n", fullpath, strerror(errno));
+            free(fullpath);
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            traverse_directory(fullpath, re, opts);
+        } else if (S_ISREG(st.st_mode)) {
+            /* Skip binary files */
+            if (!is_binary_file(fullpath)) {
+                search_file(fullpath, re, opts);
+            }
+        }
+        free(fullpath);
+    }
+    closedir(dir);
+}
+
+int main(int argc, char *argv[]) {
+    Options opts = {0, 0, 0};
+    const char *pattern = NULL;
+    const char *path = NULL;
+    /* Parse options. Simple manual parsing to avoid pulling in getopt_long() */
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--color") == 0) {
+            opts.use_color = 1;
+            opts.color_forced = 1;
+        } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-color") == 0) {
+            opts.use_color = 0;
+            opts.no_color = 1;
+        } else if (!pattern) {
+            pattern = arg;
+        } else if (!path) {
+            path = arg;
+        } else {
+            fprintf(stderr, "Unknown argument: %s\n", arg);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+    if (!pattern || !path) {
+        fprintf(stderr, "Error: PATTERN and PATH are required.\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+    /* Determine whether to use color by default: if not explicitly set by
+     * user, enable color if stdout is a TTY. */
+    if (!opts.color_forced && !opts.no_color) {
+        opts.use_color = isatty(fileno(stdout));
+    }
+    /* Compile regular expression */
+    regex_t re;
+    int cflags = REG_EXTENDED;
+    int rc = regcomp(&re, pattern, cflags);
+    if (rc != 0) {
+        char errbuf[256];
+        regerror(rc, &re, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Error compiling regex '%s': %s\n", pattern, errbuf);
+        return 1;
+    }
+    /* Determine whether path is file or directory */
+    struct stat st;
+    if (stat(path, &st) == -1) {
+        fprintf(stderr, "Error: cannot stat '%s': %s\n", path, strerror(errno));
+        regfree(&re);
+        return 1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        traverse_directory(path, &re, &opts);
+    } else if (S_ISREG(st.st_mode)) {
+        if (!is_binary_file(path)) {
+            search_file(path, &re, &opts);
+        }
+    } else {
+        fprintf(stderr, "Error: '%s' is not a file or directory\n", path);
+    }
+    regfree(&re);
+    return 0;
+}
