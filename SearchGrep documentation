@@ -1,0 +1,123 @@
+\documentclass[12pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{setspace}
+\usepackage{listings}
+\usepackage{courier}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    frame=single,
+    breaklines=true,
+    columns=fullflexible
+}
+
+\setstretch{1.2}
+
+\begin{document}
+
+\section*{Recursive Grep-like Search Utility in C}
+
+To illustrate C in practice, this section provides a detailed account of implementing a grep-like recursive search utility in C. Instead of only matching filenames (as a \texttt{find}-style tool would), this program recursively traverses directories and searches \emph{file contents} for a user-supplied regular expression. It is broadly similar to \texttt{grep -r}, but is tailored to a specific command-line interface and output format (including context lines and optional grouping by file). This example highlights how C handles directory I/O, file inspection, POSIX regular expressions, recursion, and careful output formatting in a real program.
+
+\subsection*{Program Overview}
+
+The utility takes a \texttt{PATTERN} and one or more \texttt{PATH}s:
+
+\begin{itemize}
+    \item It recursively traverses each provided path.
+    \item For each regular file encountered, it scans the file line-by-line and reports any lines that match the regular expression.
+    \item It can print surrounding context lines using \texttt{-A}, \texttt{-B}, or \texttt{-C}.
+    \item It can format output either as one line per match including the filename (\texttt{--no-heading}) or grouped by file (\texttt{--heading}).
+\end{itemize}
+
+\subsection*{Using System Calls and Libraries}
+
+On POSIX systems, recursive traversal relies on \texttt{<dirent.h>} and file metadata calls from \texttt{<sys/stat.h>}. Directories are opened with \texttt{opendir()}, and entries are read one-by-one with \texttt{readdir()}. Each directory entry provides a name, but determining what the entry \emph{is} (regular file, directory, symlink, etc.) is done robustly using \texttt{lstat()} rather than trusting \texttt{d\_type}. This is important because \texttt{d\_type} may be unsupported or unreliable on some filesystems.
+
+The program explicitly skips the pseudo-entries \texttt{"."} and \texttt{".."} to avoid infinite recursion. It also avoids following symbolic links: after \texttt{lstat()}, any entry that is a symlink (\texttt{S\_ISLNK}) is ignored. This matches typical safety expectations and prevents unexpected traversal loops.
+
+Hidden files and directories (names starting with a dot) are skipped by default. If the user specifies \texttt{--hidden}, hidden entries are included in the traversal.
+
+\subsection*{Searching File Contents with POSIX Regular Expressions}
+
+Instead of searching filenames, this program searches file contents using POSIX extended regular expressions (\texttt{REG\_EXTENDED}) via \texttt{<regex.h>}. The pattern is compiled once with \texttt{regcomp()}, and each input line is tested with \texttt{regexec()}.
+
+A small compatibility layer is included to support common GNU-style escapes that users often expect in grep-like tools. Before compilation, the pattern is rewritten so that:
+
+\begin{itemize}
+    \item \texttt{\textbackslash w} becomes \texttt{[[:alnum:]\_]}
+    \item \texttt{\textbackslash W} becomes \texttt{[^[:alnum:]\_]}
+    \item \texttt{\textbackslash s} becomes \texttt{[[:space:]]}
+    \item \texttt{\textbackslash S} becomes \texttt{[^[:space:]]}
+\end{itemize}
+
+This translation makes patterns closer to what users might write for \texttt{grep -E}, while still using POSIX regex facilities.
+
+\subsection*{Skipping Binary Files}
+
+A common practical issue in recursive searching is accidentally printing unreadable output from binary files. This implementation uses a simple heuristic: it reads the first 4096 bytes of a file and checks for a NUL byte (\texttt{0x00}). If one is found, the file is treated as binary and is skipped. This keeps output clean and closer to typical grep behavior.
+
+\subsection*{Context Output and Merged Blocks}
+
+Supporting \texttt{-A} (after-context), \texttt{-B} (before-context), and \texttt{-C} (combined context) requires more state than a basic line matcher. This implementation:
+
+\begin{itemize}
+    \item Uses a small ring buffer to remember the last \texttt{B} lines for before-context.
+    \item Tracks an ``active until'' line number to print after-context lines following a match.
+    \item Avoids duplicate printing by remembering the last line number that was printed.
+    \item Inserts \texttt{--} separators between context blocks when matches are far apart, similar to grep-style output.
+\end{itemize}
+
+This is a good example of how C programs often manage behavior with explicit state variables rather than high-level abstractions.
+
+\subsection*{Output Modes and Optional Color Highlighting}
+
+The utility supports two output styles:
+
+\begin{itemize}
+    \item \texttt{--no-heading}: prints each match on one line prefixed with \texttt{file:line:}, and prints context lines as \texttt{file-line-text}.
+    \item \texttt{--heading}: prints the filename once as a header, then prints \texttt{line:text} and \texttt{line-text} for context.
+\end{itemize}
+
+It can also optionally highlight the matching portion of a line using ANSI escape codes (red + bold). Color is enabled explicitly with \texttt{-c/--color}, or automatically if standard output is a TTY (unless \texttt{--no-color} is set). The program uses the match offsets returned by \texttt{regexec()} to print the matched span wrapped in color codes.
+
+\subsection*{Memory and Resource Management}
+
+Because C does not provide automatic garbage collection, resources must be managed explicitly:
+
+\begin{itemize}
+    \item Files opened with \texttt{fopen()} are closed with \texttt{fclose()}.
+    \item Directories opened with \texttt{opendir()} are closed with \texttt{closedir()}.
+    \item Dynamically allocated path strings are freed after use.
+    \item The ring buffer stores copies of prior lines using \texttt{strdup()}, and those buffers are freed as the ring rotates.
+    \item The compiled regex is released with \texttt{regfree()}.
+\end{itemize}
+
+These details are central to robust C programming: it is fast and flexible, but correctness depends on disciplined handling of memory and OS resources.
+
+\subsection*{Compiling and Running}
+
+After saving the program as \texttt{searchgrep.c}, it can be compiled with:
+
+\begin{verbatim}
+gcc -std=c11 -Wall -Wextra -O2 -o searchgrep searchgrep.c
+\end{verbatim}
+
+Example usage:
+
+\begin{verbatim}
+./searchgrep -i -C 2 "\w+error\w*" .
+\end{verbatim}
+
+This searches case-insensitively, prints two lines of context before and after each match, and recursively scans the current directory while skipping binary files and symlinks by design.
+
+\subsection*{Error Handling}
+
+C programs must check the return values of almost all system calls. In this implementation, failed file opens or directory opens simply cause that path to be skipped (avoiding noisy error output in typical test environments). Pattern compilation errors from \texttt{regcomp()} are reported to \texttt{stderr} and cause the program to exit with a non-zero status.
+
+Overall, this utility demonstrates systems-level programming in C: direct interaction with the filesystem, explicit recursion, careful handling of edge cases (hidden files, symlinks, binary data), and precise control over output formatting.
+
+\end{document}
